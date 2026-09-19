@@ -11,23 +11,20 @@ use glide_core::model::Vm;
 use std::path::Path;
 
 use objc2::rc::Retained;
+use objc2::AllocAnyThread;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use objc2_virtualization as vz;
 
 /// Is Virtualization.framework usable here at all?
 pub fn supported() -> bool {
     // VZ is available on macOS 11+, and VZEFIBootLoader (which we require for
-    // the ISO->installed handoff) needs macOS 13. A conservative runtime
-    // probe: the class must exist.
-    std::any::Any::type_id_of::<vz::VZEFIBootLoader>();
+    // the ISO->installed handoff) needs macOS 13. The class reference resolves
+    // at link time; a true runtime probe is a host capability check done on
+    // the Mac during verification.
     true
 }
 
 /// Create an empty raw disk image of `bytes` at `path`.
-///
-/// Virtualization.framework attaches plain raw images via
-/// VZDiskImageStorageDeviceAttachment; the file must exist and be the full
-/// size before attach.
 pub fn create_disk_image(path: &Path, bytes: u64) -> Result<(), BackendError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -52,7 +49,6 @@ pub fn clone_disk_cow(from: &Path, to: &Path) -> Result<(), BackendError> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn clonefile(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -70,8 +66,13 @@ fn clonefile(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Build the virtual-machine configuration: EFI boot, one virtio disk,
-/// NAT networking, entropy, and a serial console we can read.
+unsafe fn nsurl_for(path: &Path) -> Retained<NSURL> {
+    let s = NSString::from_str(&path.to_string_lossy());
+    NSURL::fileURLWithPath(&s)
+}
+
+/// Build the virtual-machine configuration: EFI boot, one virtio disk plus
+/// the installer ISO when present, NAT networking, entropy.
 unsafe fn build_config(
     vm: &Vm,
     disk: &Path,
@@ -89,17 +90,17 @@ unsafe fn build_config(
     // Generic platform (Linux guest). VZGenericPlatformConfiguration
     // subclasses VZPlatformConfiguration; setPlatform wants the superclass ref.
     let platform = unsafe { vz::VZGenericPlatformConfiguration::new() };
-    let platform_super: &vz::VZPlatformConfiguration =
-        unsafe { &*(&*platform as *const _ as *const _) };
-    unsafe { config.setPlatform(platform_super) };
+    let platform: Retained<vz::VZPlatformConfiguration> = platform.into_super();
+    unsafe { config.setPlatform(&platform) };
 
     // EFI boot loader boots whatever is on the attached media — the ISO
     // during install, the installed system afterward. This is the handoff.
     let boot = unsafe { vz::VZEFIBootLoader::new() };
+    let boot: Retained<vz::VZBootLoader> = boot.into_super();
     unsafe { config.setBootLoader(Some(&boot)) };
 
-    // Storage: the VM's disk, read-write, plus the installer ISO read-only
-    // when present.
+    // Storage: the VM's disk (read-write), plus the installer ISO (read-only)
+    // when present. Both subclass VZStorageDeviceConfiguration.
     let mut storage: Vec<Retained<vz::VZStorageDeviceConfiguration>> = Vec::new();
 
     let disk_url = unsafe { nsurl_for(disk) };
@@ -111,13 +112,14 @@ unsafe fn build_config(
         )
         .map_err(|e| BackendError::Op(format!("attach disk: {e:?}")))?
     };
+    let disk_attach: Retained<vz::VZStorageDeviceAttachment> = disk_attach.into_super();
     let disk_cfg = unsafe {
         vz::VZVirtioBlockDeviceConfiguration::initWithAttachment(
             vz::VZVirtioBlockDeviceConfiguration::alloc(),
             &disk_attach,
         )
     };
-    storage.push(unsafe { Retained::cast(disk_cfg) });
+    storage.push(disk_cfg.into_super());
 
     if let Some(iso_path) = iso {
         let iso_url = unsafe { nsurl_for(iso_path) };
@@ -129,26 +131,30 @@ unsafe fn build_config(
             )
             .map_err(|e| BackendError::Op(format!("attach iso: {e:?}")))?
         };
+        let iso_attach: Retained<vz::VZStorageDeviceAttachment> = iso_attach.into_super();
         let iso_cfg = unsafe {
             vz::VZUSBMassStorageDeviceConfiguration::initWithAttachment(
                 vz::VZUSBMassStorageDeviceConfiguration::alloc(),
                 &iso_attach,
             )
         };
-        storage.push(unsafe { Retained::cast(iso_cfg) });
+        storage.push(iso_cfg.into_super());
     }
     let storage_arr = NSArray::from_retained_slice(&storage);
     unsafe { config.setStorageDevices(&storage_arr) };
 
     // Entropy (needed for guest crypto / ssh keygen).
     let entropy = unsafe { vz::VZVirtioEntropyDeviceConfiguration::new() };
+    let entropy: Retained<vz::VZEntropyDeviceConfiguration> = entropy.into_super();
     let entropy_arr = NSArray::from_retained_slice(&[entropy]);
     unsafe { config.setEntropyDevices(&entropy_arr) };
 
     // NAT networking — no entitlement needed.
     let net_attach = unsafe { vz::VZNATNetworkDeviceAttachment::new() };
+    let net_attach: Retained<vz::VZNetworkDeviceAttachment> = net_attach.into_super();
     let net = unsafe { vz::VZVirtioNetworkDeviceConfiguration::new() };
     unsafe { net.setAttachment(Some(&net_attach)) };
+    let net: Retained<vz::VZNetworkDeviceConfiguration> = net.into_super();
     let net_arr = NSArray::from_retained_slice(&[net]);
     unsafe { config.setNetworkDevices(&net_arr) };
 
@@ -160,11 +166,6 @@ unsafe fn build_config(
     };
 
     Ok(config)
-}
-
-unsafe fn nsurl_for(path: &Path) -> Retained<NSURL> {
-    let s = NSString::from_str(&path.to_string_lossy());
-    NSURL::fileURLWithPath(&s)
 }
 
 /// Run a VM to a terminal point, reporting progress.
