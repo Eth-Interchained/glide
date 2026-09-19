@@ -1,36 +1,61 @@
-name: ci
-
+name: real-backend
 on:
   push:
     branches: [main]
   pull_request:
-
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  test:
-    name: test / clippy / fmt (ubuntu)
+  linux-real-qemu:
+    name: Linux real QEMU and UI tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Build (glide-vz stubs out off macOS)
-        run: cargo build --workspace
-      - name: Test
-        run: cargo test --workspace
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: rustfmt
-        run: cargo fmt --all -- --check
-
-  macos-build:
-    # The real Virtualization.framework backend only compiles on macOS.
-    name: glide-vz builds (macos)
-    runs-on: macos-15
+      - name: Install real emulator
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils
+      - name: Fetch checksum-pinned real installer
+        run: |
+          curl -fL --retry 3 -o /tmp/alpine-virt-3.21.3-x86_64.iso https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-virt-3.21.3-x86_64.iso
+          echo 'f28171c35bbf623aa3cbaec4b8b29297f13095b892c1a283b15970f7eb490f2d  /tmp/alpine-virt-3.21.3-x86_64.iso' | sha256sum -c -
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo fmt --all -- --check
+      - name: Actual emulator lifecycle, storage, timeout and ejection
+        env:
+          GLIDE_TEST_ISO: /tmp/alpine-virt-3.21.3-x86_64.iso
+          GLIDE_ACCEL: tcg
+          GLIDE_DISPLAY: none
+          GLIDE_AUDIT: nedb
+        run: cargo test --locked -p glide-core -- --ignored --test-threads=1
+  intel-macos:
+    name: Intel macOS GUI and CLI package
+    runs-on: macos-15-intel
+    timeout-minutes: 25
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Build the vz backend for real
-        run: cargo build -p glide-vz --target aarch64-apple-darwin || cargo build -p glide-vz
+      - name: Require an Intel runner
+        run: test "$(uname -m)" = x86_64
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Package app and CLI
+        run: bash scripts/package-macos.sh x86_64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glide-Intel-macOS
+          path: |
+            dist/x86_64-apple-darwin/Glide-x86_64-apple-darwin.zip
+            dist/x86_64-apple-darwin/SHA256SUMS
+          if-no-files-found: error
