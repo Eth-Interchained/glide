@@ -1,0 +1,22 @@
+[package]
+name = "glide-cli"
+description = "glide — the Glide VM manager command line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "glide"
+path = "src/main.rs"
+
+[dependencies]
+glide-core = { path = "../glide-core" }
+glide-vz = { path = "../glide-vz" }
+clap.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

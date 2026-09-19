@@ -1,0 +1,23 @@
+[package]
+name = "glide-gui"
+description = "glide-gui — the Glide VM manager desktop UI, built on Forge UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "glide-gui"
+path = "src/main.rs"
+
+[dependencies]
+glide-core = { path = "../glide-core" }
+glide-vz = { path = "../glide-vz" }
+forge-ui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

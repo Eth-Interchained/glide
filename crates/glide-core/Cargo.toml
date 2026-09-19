@@ -1,0 +1,24 @@
+[package]
+name = "glide-core"
+description = "Glide VM manager engine — domain model, state machine, and NEDB-backed lineage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+nedb-engine.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+time.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

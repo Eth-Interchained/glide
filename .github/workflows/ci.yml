@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test / clippy / fmt (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (glide-vz stubs out off macOS)
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  macos-build:
+    # The real Virtualization.framework backend only compiles on macOS.
+    name: glide-vz builds (macos)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the vz backend for real
+        run: cargo build -p glide-vz --target aarch64-apple-darwin || cargo build -p glide-vz
