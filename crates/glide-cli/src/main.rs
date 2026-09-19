@@ -282,13 +282,18 @@ fn run() -> Result<()> {
             println!("Stopped {name}")
         }
         Cmd::ForceStop { name, yes } => {
+            let target = service.status(&name)?.config;
             confirm(
                 &name,
-                "Force power off: unsaved guest data may be lost",
+                &format!(
+                    "Force power off {} [{}]: unsaved guest data may be lost",
+                    target.name, target.id
+                ),
                 yes,
             )?;
-            service.force_stop(&name)?;
-            println!("Powered off {name}")
+            // Names can be reused while the confirmation prompt waits.
+            service.force_stop(&target.id)?;
+            println!("Powered off {} [{}]", target.name, target.id)
         }
         Cmd::Restart { name } => {
             service.restart(&name)?;
@@ -304,9 +309,22 @@ fn run() -> Result<()> {
             println!("Removed {name} from library; virtual disk retained")
         }
         Cmd::Delete { name, yes } => {
-            confirm(&name, "Delete VM and its virtual disk permanently", yes)?;
-            service.remove(&name, true)?;
-            println!("Deleted {name} and its app-owned virtual disk")
+            let target = service.status(&name)?.config;
+            confirm(
+                &name,
+                &format!(
+                    "Permanently delete {} [{}] and disk {}",
+                    target.name,
+                    target.id,
+                    target.disk.display()
+                ),
+                yes,
+            )?;
+            service.remove(&target.id, true)?;
+            println!(
+                "Deleted {} [{}] and its app-owned virtual disk",
+                target.name, target.id
+            )
         }
     }
     Ok(())

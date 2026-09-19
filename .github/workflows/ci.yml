@@ -33,6 +33,14 @@ jobs:
           GLIDE_DISPLAY: none
           GLIDE_AUDIT: nedb
         run: cargo test --locked -p glide-core -- --ignored --test-threads=1
+      - name: Real CLI confirmation race regression
+        env:
+          GLIDE_TEST_ISO: /tmp/alpine-virt-3.21.3-x86_64.iso
+          GLIDE_ACCEL: tcg
+          GLIDE_DISPLAY: none
+        run: |
+          cargo build --locked -p glide-cli
+          python3 scripts/test-confirmation-race.py
   intel-macos:
     name: Intel macOS GUI and CLI package
     runs-on: macos-15-intel

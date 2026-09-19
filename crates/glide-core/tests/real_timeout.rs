@@ -1,6 +1,11 @@
 //! A real QEMU process is suspended to exercise actual socket read deadlines.
 use glide_core::{CreateOptions, Service};
-use std::{fs, path::PathBuf, time::Instant};
+use std::{
+    fs,
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 struct Resume(i32);
 impl Drop for Resume {
     fn drop(&mut self) {
@@ -59,7 +64,24 @@ fn unresponsive_real_qemu_is_unknown_not_stopped() {
         "don't delete a possibly live disk"
     );
     drop(resume);
-    assert_eq!(s.status(&id).unwrap().state, "running");
+
+    // SIGCONT schedules QEMU to resume, but QMP recovery is asynchronous on
+    // loaded Linux runners. Poll with a hard bound rather than assuming that
+    // the first status request after SIGCONT must already succeed.
+    let resumed = Instant::now();
+    loop {
+        let state = s.status(&id).unwrap().state;
+        if state == "running" {
+            break;
+        }
+        assert_eq!(state, "unknown", "resuming QEMU entered unexpected state");
+        assert!(
+            resumed.elapsed() < Duration::from_secs(10),
+            "QEMU did not recover its QMP control channel after SIGCONT"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
     assert!(s.status(&id).unwrap().config.iso.is_some());
     s.force_stop(&id).unwrap();
     assert_eq!(s.status(&id).unwrap().state, "stopped");
