@@ -14,10 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 glide-core = { path = "../glide-core" }
-glide-vz = { path = "../glide-vz" }
-forge-ui.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+forge-ui = "=0.2.0"
+anyhow.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

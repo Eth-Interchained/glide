@@ -1,6 +1,6 @@
 [package]
 name = "glide-core"
-description = "Glide VM manager engine — domain model, state machine, and NEDB-backed lineage"
+description = "Real QEMU/HVF VM service with persistent disks and live QMP control"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,5 +20,6 @@ time.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 
-[dev-dependencies]
+fs2 = "0.4"
+libc = "0.2"
 tempfile = "3"

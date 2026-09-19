@@ -1,226 +1,338 @@
-//! `glide` — the Glide VM manager CLI.
-//!
-//! Backend selection: on macOS the default is Virtualization.framework;
-//! `--backend mock` drives the in-memory backend (used for tests and for
-//! exercising the flow without a hypervisor). Off macOS the mock backend is
-//! the only one available and is selected automatically with a note.
-
-use anyhow::{Context, Result};
+//! CLI over the same real VM service used by Forge UI.
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use glide_core::backend::{Backend, MockBackend, Progress};
-use glide_core::Engine;
-use std::path::PathBuf;
+use glide_core::{CreateOptions, Service};
+use std::{
+    io::{self, IsTerminal, Read, Write},
+    path::PathBuf,
+};
 
 #[derive(Parser)]
 #[command(
     name = "glide",
     version,
-    about = "Glide — a macOS VM manager with provable lineage"
+    about = "Boot Linux ISOs on macOS using QEMU/HVF"
 )]
 struct Cli {
-    /// Backend to use: "vz" (macOS Virtualization.framework) or "mock".
     #[arg(long, global = true)]
-    backend: Option<String>,
-
-    /// Root directory for Glide's state (disks, snapshots, lineage db).
-    #[arg(long, global = true, default_value = "~/.glide")]
-    root: String,
-
+    root: Option<PathBuf>,
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    command: Cmd,
 }
-
 #[derive(Subcommand)]
 enum Cmd {
-    /// Register an ISO installer image (checksums it into the lineage store).
-    RegisterIso {
-        /// Path to the .iso file.
-        path: PathBuf,
-        /// Optional human label.
-        #[arg(long)]
-        label: Option<String>,
-    },
-    /// Create a new VM (empty disk, state=created).
+    /// Check real QEMU, accelerator and display availability.
+    Doctor,
+    #[command(alias = "ls")]
+    List,
     Create {
-        name: String,
-        #[arg(long, default_value = "64")]
-        disk_gb: u64,
-        #[arg(long, default_value = "8")]
-        mem_gb: u64,
-    },
-    /// Install a VM from a registered ISO (the ISO -> installed handoff).
-    Install {
-        name: String,
-        /// sha256 of a registered ISO (or a unique prefix).
         #[arg(long)]
-        iso: String,
+        name: String,
+        #[arg(long)]
+        iso: PathBuf,
+        /// Explicit guest architecture; otherwise inspect ISO evidence.
+        #[arg(long)]
+        arch: Option<String>,
+        #[arg(long, default_value_t = 4)]
+        cpu: u32,
+        #[arg(long, default_value = "8G")]
+        memory: String,
+        #[arg(long, default_value = "64G")]
+        disk: String,
+        #[arg(long)]
+        boot: bool,
     },
-    /// Boot an installed VM.
-    Start { name: String },
-    /// Stop a running VM.
-    Stop { name: String },
-    /// Snapshot a VM's current disk state.
-    Snapshot { name: String, label: String },
-    /// Show a VM's full provenance: disk -> installing ISO -> snapshots.
-    Trace { name: String },
-    /// List VMs.
-    Ls,
-    /// List registered ISOs.
-    Isos,
+    Start {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
+    /// Power off immediately: unsaved guest data can be lost.
+    ForceStop {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    Restart {
+        name: String,
+    },
+    Status {
+        name: String,
+    },
+    /// Detach the installer explicitly; never infers installation completion.
+    Eject {
+        name: String,
+    },
+    Display {
+        name: String,
+    },
+    /// Interactive serial socket. Guest must enable its serial console. Ctrl-] detaches.
+    Console {
+        name: String,
+    },
+    Logs {
+        name: String,
+    },
+    /// Remove registration and KEEP the virtual disk.
+    Remove {
+        name: String,
+    },
+    /// Remove VM and its app-owned virtual disk; requires confirmation.
+    Delete {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
-
-fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
+fn size_mib(value: &str) -> Result<u64> {
+    let s = value.trim().to_ascii_uppercase();
+    let (number, mult) = if let Some(x) = s.strip_suffix("GIB").or_else(|| s.strip_suffix('G')) {
+        (x, 1024)
+    } else if let Some(x) = s.strip_suffix("MIB").or_else(|| s.strip_suffix('M')) {
+        (x, 1)
+    } else {
+        (s.as_str(), 1)
+    };
+    number
+        .parse::<u64>()
+        .context("size must be an integer with M or G suffix")?
+        .checked_mul(mult)
+        .context("size overflow")
+}
+fn confirm(name: &str, action: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!("{action} requires explicit --yes in noninteractive use")
+    }
+    eprint!("{action}. Type the exact VM name or ID '{name}' to confirm: ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    if line.trim() != name {
+        bail!("cancelled; no changes made")
+    }
+    Ok(())
+}
+struct RawTerminal(Option<libc::termios>);
+impl RawTerminal {
+    fn enter() -> Result<Self> {
+        if !io::stdin().is_terminal() {
+            return Ok(Self(None));
+        }
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr initializes the termios buffer for valid stdin fd.
+        if unsafe { libc::tcgetattr(0, original.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let original = unsafe { original.assume_init() };
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(Self(Some(original)))
+    }
+}
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        if let Some(t) = &self.0 {
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
         }
     }
-    PathBuf::from(p)
 }
-
-fn print_progress(p: Progress) {
-    match p {
-        Progress::Working(phase) => println!("  .. {phase}"),
-        Progress::ConsoleLine(line) => println!("  | {line}"),
-        Progress::Done => println!("  .. done"),
-    }
-}
-
-fn run_with<B: Backend>(eng: &mut Engine<B>, cmd: &Cmd) -> Result<()> {
-    match cmd {
-        Cmd::RegisterIso { path, label } => {
-            let iso = eng
-                .register_iso(path, label.as_deref())
-                .with_context(|| format!("register iso {}", path.display()))?;
-            println!(
-                "registered {} ({:.1} GiB)",
-                iso.label,
-                iso.size_bytes as f64 / 1e9
-            );
-            println!("  sha256 {}", iso.sha256);
-        }
-        Cmd::Create {
-            name,
-            disk_gb,
-            mem_gb,
-        } => {
-            let vm = eng.create_vm(name, *disk_gb, *mem_gb)?;
-            println!(
-                "created {} [{}] — state {}",
-                vm.config.name,
-                vm.id,
-                vm.state.label()
-            );
-        }
-        Cmd::Install { name, iso } => {
-            // Resolve a unique sha256 prefix.
-            let isos = eng.store.isos()?;
-            let matches: Vec<_> = isos
-                .iter()
-                .filter(|i| i.sha256.starts_with(iso.as_str()))
-                .collect();
-            let sha = match matches.len() {
-                1 => matches[0].sha256.clone(),
-                0 => anyhow::bail!("no registered iso matches {iso}"),
-                _ => anyhow::bail!("ambiguous iso prefix {iso} ({} matches)", matches.len()),
-            };
-            println!("installing {name} from iso {sha:.12}…");
-            let vm = eng.install_from_iso(name, &sha, &mut print_progress)?;
-            println!("installed {} — state {}", vm.config.name, vm.state.label());
-        }
-        Cmd::Start { name } => {
-            let vm = eng.start(name, &mut print_progress)?;
-            println!("started {} — state {}", vm.config.name, vm.state.label());
-        }
-        Cmd::Stop { name } => {
-            let vm = eng.stop(name)?;
-            println!("stopped {} — state {}", vm.config.name, vm.state.label());
-        }
-        Cmd::Snapshot { name, label } => {
-            let s = eng.snapshot(name, label)?;
-            println!(
-                "snapshot {} \"{}\" at {}",
-                &s.id[..8],
-                s.label,
-                s.created_at
-            );
-        }
-        Cmd::Trace { name } => {
-            for line in eng.trace(name)? {
-                println!("{line}");
+fn console(path: PathBuf) -> Result<()> {
+    use std::os::{fd::AsRawFd, unix::net::UnixStream};
+    let mut stream = UnixStream::connect(path).context("connect guest serial console")?;
+    eprintln!("Connected to guest serial. Ctrl-] detaches. A blank console means the guest has not enabled serial output.");
+    let _raw = RawTerminal::enter()?;
+    let mut buf = [0; 4096];
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(e.into());
         }
-        Cmd::Ls => {
-            let vms = eng.list()?;
-            if vms.is_empty() {
-                println!("no VMs");
+        if fds[0].revents & libc::POLLIN != 0 {
+            let n = io::stdin().read(&mut buf)?;
+            if n == 0 {
+                break;
             }
-            for v in vms {
-                let disk = v
-                    .disk
-                    .as_ref()
-                    .map(|d| format!("{} GiB", d.capacity_bytes / (1024 * 1024 * 1024)))
-                    .unwrap_or_else(|| "no disk".into());
-                println!(
-                    "{:<20} {:<11} {:<8} {} cpu  {}",
-                    v.config.name,
-                    v.state.label(),
-                    disk,
-                    v.config.cpu_count,
-                    v.failure.as_deref().unwrap_or("")
-                );
+            if let Some(i) = buf[..n].iter().position(|b| *b == 0x1d) {
+                stream.write_all(&buf[..i])?;
+                break;
             }
+            stream.write_all(&buf[..n])?;
         }
-        Cmd::Isos => {
-            let isos = eng.store.isos()?;
-            if isos.is_empty() {
-                println!("no ISOs registered");
+        if fds[1].revents & libc::POLLIN != 0 {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break;
             }
-            for i in isos {
-                println!(
-                    "{:<32} {:.1} GiB  sha256 {}…",
-                    i.label,
-                    i.size_bytes as f64 / 1e9,
-                    &i.sha256[..12]
-                );
-            }
+            io::stdout().write_all(&buf[..n])?;
+            io::stdout().flush()?;
+        }
+        if fds
+            .iter()
+            .any(|p| p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
+        {
+            break;
         }
     }
     Ok(())
 }
-
-fn main() -> Result<()> {
+fn run() -> Result<()> {
     let cli = Cli::parse();
-    let root = expand_tilde(&cli.root);
-
-    let backend = cli
-        .backend
-        .as_deref()
-        .unwrap_or(if cfg!(target_os = "macos") {
-            "vz"
-        } else {
-            "mock"
-        });
-
-    match backend {
-        "mock" => {
-            let mut eng = Engine::new(&root, MockBackend::new())?;
-            eprintln!("[backend: mock]");
-            run_with(&mut eng, &cli.cmd)
-        }
-        "vz" => {
-            #[cfg(target_os = "macos")]
-            {
-                let be = glide_vz::VzBackend::new()?;
-                let mut eng = Engine::new(&root, be)?;
-                eprintln!("[backend: {}]", eng.backend_name());
-                run_with(&mut eng, &cli.cmd)
+    let service = Service::open(cli.root.unwrap_or_else(Service::default_root))?;
+    match cli.command {
+        Cmd::Doctor => {
+            let b = service.discover();
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&b)?)
+            } else {
+                println!("{} / {}\n{}", b.architecture, b.accelerator, b.detail)
             }
-            #[cfg(not(target_os = "macos"))]
-            {
-                anyhow::bail!("the vz backend requires macOS; use --backend mock here")
+            if !b.available {
+                bail!("backend unavailable")
             }
         }
-        other => anyhow::bail!("unknown backend {other:?} (expected vz or mock)"),
+        Cmd::List => {
+            let list = service.list()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&list)?)
+            } else {
+                if list.is_empty() {
+                    println!(
+                        "No VMs. Use glide create --name ubuntu --iso /path/to/ubuntu.iso --boot"
+                    )
+                }
+                for m in list {
+                    println!(
+                        "{}\t{}\t{}\t{} CPU / {} MiB / {} GiB",
+                        m.config.name,
+                        m.config.id,
+                        m.state,
+                        m.config.cpu,
+                        m.config.memory_mb,
+                        m.config.disk_gb
+                    )
+                }
+            }
+        }
+        Cmd::Create {
+            name,
+            iso,
+            arch,
+            cpu,
+            memory,
+            disk,
+            boot,
+        } => {
+            let disk_mib = size_mib(&disk)?;
+            anyhow::ensure!(disk_mib % 1024 == 0, "disk must be whole GiB, e.g. 64G");
+            let m = service.create(CreateOptions {
+                name,
+                iso,
+                architecture: arch,
+                cpu,
+                memory_mb: size_mib(&memory)?,
+                disk_gb: disk_mib / 1024,
+            })?;
+            if boot {
+                service.start(&m.config.id).with_context(||format!("VM {} was created and its disk retained, but boot failed. Use glide logs '{}'",m.config.id,m.config.id))?;
+            }
+            let m = service.status(&m.config.id)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&m)?)
+            } else {
+                println!("{} [{}]: {}", m.config.name, m.config.id, m.state)
+            }
+        }
+        Cmd::Status { name } => {
+            let m = service.status(&name)?;
+            println!("{}", serde_json::to_string_pretty(&m)?)
+        }
+        Cmd::Logs { name } => print!("{}", service.logs(&name)?),
+        Cmd::Console { name } => console(service.console_path(&name)?)?,
+        Cmd::Start { name } => {
+            service.start(&name)?;
+            println!("{}", serde_json::to_string_pretty(&service.status(&name)?)?)
+        }
+        Cmd::Stop { name } => {
+            service.stop(&name)?;
+            println!("Stopped {name}")
+        }
+        Cmd::ForceStop { name, yes } => {
+            confirm(
+                &name,
+                "Force power off: unsaved guest data may be lost",
+                yes,
+            )?;
+            service.force_stop(&name)?;
+            println!("Powered off {name}")
+        }
+        Cmd::Restart { name } => {
+            service.restart(&name)?;
+            println!("Restarted {name}")
+        }
+        Cmd::Eject { name } => {
+            service.eject(&name)?;
+            println!("Installer detached from {name}; external ISO preserved")
+        }
+        Cmd::Display { name } => service.open_display(&name)?,
+        Cmd::Remove { name } => {
+            service.remove(&name, false)?;
+            println!("Removed {name} from library; virtual disk retained")
+        }
+        Cmd::Delete { name, yes } => {
+            confirm(&name, "Delete VM and its virtual disk permanently", yes)?;
+            service.remove(&name, true)?;
+            println!("Deleted {name} and its app-owned virtual disk")
+        }
+    }
+    Ok(())
+}
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Glide: {e:#}");
+        std::process::exit(1)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sizes() {
+        assert_eq!(size_mib("8G").unwrap(), 8192);
+        assert_eq!(size_mib("512M").unwrap(), 512);
+        assert!(size_mib("nope").is_err());
+        assert!(size_mib("18446744073709551615G").is_err());
+    }
+    #[test]
+    fn create_shape() {
+        assert!(Cli::try_parse_from([
+            "glide", "create", "--name", "ubuntu", "--iso", "/a.iso", "--boot"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["glide", "--backend", "mock", "list"]).is_err());
     }
 }
